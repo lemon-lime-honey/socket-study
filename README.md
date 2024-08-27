@@ -1,6 +1,7 @@
 [Beej's Guide to Network Programming](https://beej.us/guide/bgnet/)
 
-## 환경에 따른 유의사항 - Windows
+<details>
+<summary>환경에 따른 유의사항 - Windows</summary>
 
 - 언급되는 시스템 헤더를 무시하고 다음을 include
 
@@ -45,3 +46,12 @@
   ```
 
 - 이외에도 참고할 사항이 여럿 있음
+
+</details>
+
+1. [What is a socket?](./01-socket.md)
+2. [IP Addresses, `struct`s, and Data Munging](./02-ip.md)
+3. Jumping from IPv4 to IPv6
+4. System Calls or Bust
+5. Client-Server Background
+6. Slightly Advanced Techniques
