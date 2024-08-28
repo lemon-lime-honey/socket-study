@@ -51,7 +51,7 @@
 
 1. [What is a socket?](./01-socket.md)
 2. [IP Addresses, `struct`s, and Data Munging](./02-ip.md)
-3. Jumping from IPv4 to IPv6
+3. [Jumping from IPv4 to IPv6](./03-jump.md)
 4. System Calls or Bust
 5. Client-Server Background
 6. Slightly Advanced Techniques
