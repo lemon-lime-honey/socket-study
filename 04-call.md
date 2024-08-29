@@ -271,3 +271,306 @@ bind(sockfd, res->ai_addr, res->ai_addrlen);
   - 호출할 필요가 전혀 없을 때도 있다.
   - 원격 기기에 `connect()`를 하는 중이고 로컬 포트가 몇 번인지 중요하지 않다면 간단히 `connect()`를 호출할 수 있다.
     - 그러면 소켓이 바인딩되어 있지 않은지 확인하고 필요하다면 사용되지 않은 로컬 포트에 `bind()`할 것이다.
+
+## `connect()` - 거기 너!
+
+1. telnet 애플리케이션에 사용자가 소켓 파일 기술자를 얻기 위해 명령어를 입력했다.
+2. 애플리케이션이 `socket()`을 호출한다.
+3. 사용자가 "`10.12.110.57`"의 "`23`"번 포트에 연결하라고 한다.
+4. 그 다음은?: `connect()`
+
+```c
+#include <sys/types.h>
+#include <sys/socket.h>
+
+int connect(int sockfd, struct sockaddr* serv_addr, int addrlen);
+```
+
+- `sockfd`: `socket()`을 호출했을 때 반환되는 소켓 파일 기술자
+- `serv_addr`: 목적지 포트와 IP 주소를 포함하는 `struct sockaddr`
+- `addrlen`: 서버 주소 구조의 바이트 길이
+
+위의 모든 정보는 `getaddrinfo()`의 호출 결과에서 얻을 수 있다.
+
+- 다음은 `www.example.com`의 `3490`번 포트로 소켓 연결을 생성하는 예제이다.
+
+```c
+struct addrinfo hints, *res;
+int sockfd;
+
+// first, load up address structs with getaddrinfo():
+
+memset(&hints, 0, sizeof hints);
+hints.ai_family = AF_UNSPEC;
+hints.ai_socktype = SOCK_STREAM;
+
+getaddrinfo("www.example.com", "3490", &hints, &res);
+
+// make a socket:
+
+sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+
+// connect!
+
+connect(sockfd, res->ai_addr, res->ai_addrlen);
+```
+
+- `connect()`의 반환값을 확인해야 한다. 오류가 발생하면 `errno` 변수를 설정하고 `-1`을 반환한다.
+- `bind()`를 호출하지 않은 점에 주목
+  - 보통은 로컬 포트 번호를 신경쓰지 않고, 목적지(원격 포트)에 관심을 가진다.
+  - 로컬 포트는 커널이 선택할 것이고, 우리가 연결할 사이트는 자동으로 이 정보를 받게 된다.
+
+## `listen()` - 누가 저를 좀 불러 주시겠어요?
+
+- 원격 호스트에 연결하는게 아니라 들어오는 연결을 기다리고 그걸 다뤄야 한다면?
+- `listen()` :arrow_right: `accept()`
+
+```c
+int listen(int sockfd, int backlog);
+```
+
+- `sockfd`: `socket()` 시스템 호출이 반환하는 일반적인 소켓 파일 기술자
+- `backlog`: 입력 큐에 허용되는 연결의 숫자
+  - 들어오는 연결은 `accept()`가 될 때까지 이 큐에서 대기한다.
+  - 이 변수는 큐에 대기할 수 있는 양의 한계값을 나타낸다.
+  - 대부분의 시스템은 20 정도로 제한한다.
+- `listen()` 또한 오류가 발생하면 `errno`를 설정하고 `-1`을 반환한다.
+
+- 서버가 특정한 포트에서 동작할 수 있도록 `listen()`을 호출하기 전에 `bind()`를 호출해야 한다.
+- 그러므로 들어오는 연결을 `listen`하려면 다음과 같은 순서로 시스템 호출을 해야한다.
+
+```c
+getaddressinfo();
+socket();
+bind();
+listen();
+/* accept() goes here */
+```
+
+## `accept()` - 포트 3490을 호출해주셔서 감사합니다
+
+- 아주 멀리 있는 누군가가 당신 기기의 `listen()` 중인 포트에 `connect()`를 시도한다.
+- 연결은 `accept()`가 될 때까지 큐에서 대기할 것이다.
+- 당신은 `accept()`를 호출하고 연결을 보류하라고 할 것이다.
+- 이 하나의 연결에 사용하기 위한 *새로운 소켓 파일 기술자*가 반환된다!
+- 한 개의 비용으로 *두 개의 소켓 파일 기술자*를 가지게 된다!
+- 기존의 것은 여전히 새로운 연결을 위해 listen
+- 새로운 것은 드디어 `send()`와 `recv()`를 할 준비가 되었다.
+
+```c
+#include <sys/types.h>
+#include <sys/socket.h>
+
+int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen);
+```
+
+- `sockfd`: `listen()` 중인 소켓 기술자
+- `addr`: 로컬 `struct sockaddr_storage`의 포인터
+  - 들어오는 요청에 대한 정보의 목적지
+  - 어느 호스트나 어느 포트에서 호출 중인지 알 수 있다.
+- `addrlen`: `struct sockaddr_storage`가 `accept()`에 전달되기 전에 `sizeof(struct sockaddr_storage)`로 설정되어야 하는 지역 정수 변수
+  - `accept()`는 `addr`에 이보다 더 많은 바이트를 넣지는 않을 것이다.
+  - 더 적게 넣는다면 그를 반영하기 위해 `addrlen`의 값을 변경할 것이다.
+- `accept()` 또한 오류가 발생하면 `errno`를 설정하고 `-1`을 반환한다.
+
+-다음은 사용 예시이다.
+
+```c
+#include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+
+#define MYPORT "3490" // the port users will be connecting to
+#define BACKLOG 10    // how many pending connections queue will hold
+
+int main(void) {
+  struct sockaddr_storage their_addr;
+  socklen_t addr_size;
+  struct addrinfo hints, *res;
+  int sockfd, new_fd;
+
+  // !! don't forget your error checking for these calls !!
+
+  // first, load up address structs with getaddrinfo():
+
+  memset(&hints, 0, sizeof hints);
+  hints.ai_family = AF_UNSPEC; // use IPv4 or IPv6, whichever
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE; // fill in my IP for me
+
+  getaddrinfo(NULL, MYPORT, &hints, &res);
+
+  // make a socket, bind it, and listen to it:
+
+  sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  bind(sockfd, res->ai_addr, res->ai_addrlen);
+  listen(sockfd, BACKLOG);
+
+  // now accept an incoming connection:
+
+  addr_size = sizeof their_addr;
+  new_fd = accept(sockfd, (struct sockaddr*)&their_addr, &addr_size);
+
+  // ready to communicate on socket descriptor new_fd!
+  .
+  .
+  .
+}
+```
+
+- 소켓 기술자 `new_fd`는 `send()`와 `recv()` 호출에 사용될 것이다.
+- 오직 하나의 연결만 받게 된다면 같은 포트에 연결이 들어오는 것을 방지하기 위해 `sockfd` listen을 `close()`할 수도 있다.
+
+## `send()`, `recv()` - 말을 좀 해봐!
+
+- 스트림 소켓이나 연결된 데이터그램 소켓과 통신하기 위한 함수
+- 일반적인 비연결 데이터그램 소켓을 사용하고 싶다면 `sendto()`나 `recvfrom()`을 확인한다.
+
+### `send()`
+
+```c
+int send(int sockfd, const void* msg, int len, int flags);
+```
+
+- `sockfd`: 목적지의 소켓 기술자
+  - `socket()`에서 반환된 것, `accept()`로 얻은 것 모두 사용 가능
+- `msg`: 보내려는 데이터의 포인터
+- `len`: 보내려는 데이터의 바이트 길이
+- `flags`: `0`으로 설정한다.
+
+- 예시
+
+```c
+char *msg = "Obi-Wan was here!";
+int len, bytes_sent;
+.
+.
+.
+len = strlen(msg);
+bytes_sent = send(sockfd, msg, len, 0);
+.
+.
+.
+```
+
+- `send()`: 송신한 바이트수를 반환. *보내라고 한 것보다 적을 수 있다.*
+  - `send()`의 반환값과 `len` 값이 일치하지 않을 때 문자열의 나머지를 보내는 건 사용자에게 달린 문제다.
+  - 패킷이 작다면(대략 1K보다 작은 정도) 한 번에 전체를 보낼 수 있을지도 모른다.
+- 오류가 발생하면 `errno`를 오류값으로 설정하고 `-1`을 반환한다.
+
+### `recv()`
+
+```c
+int recv(int sockfd, void* buf, int len, int flags);
+```
+
+- `sockfd`: 읽어들일 소켓 기술자
+- `buf`: 정보를 읽어들일 버퍼
+- `len`: 버퍼의 최대 길이
+- `flags`: `0`으로 설정한다.
+- 오류가 발생하면 `errno`를 설정하고 `-1`을 반환한다.
+- 원격 쪽에서 연결을 닫으면 `0`을 반환한다.
+
+## `sendto()`, `recvfrom()` - DGRAM으로 말을 좀 해 봐
+
+### `sendto()`
+
+데이터그램 소켓은 원격 호스트에 연결되어 있지 않기 때문에 패킷을 보내기 전에 목적지 주소를 먼저 전달해야 한다.
+
+```c
+int sendto(int sockfd, const void* msg, int len, unsigned int flags,
+           const struct sockaddr* to, socklen_t tolen);
+```
+
+- 기본적으로 두 개의 인자가 추가된 `send()`와 같다.
+- `to`: 목적지 IP 주소와 포트를 포함하는 `struct sockaddr`의 포인터
+  - `sockaddr_in`, `sockaddr_in6`, 또는 캐스팅된 `sockaddr_storage`가 될 수 있다.
+- `tolen`: `sizeof* to` 또는 `sizeof(struct sockaddr_storage)`로 설정할 수 있는 `int`
+
+목적지 주소 구조체를 얻으려면 `getaddrinfo()` 또는 `recvfrom()`으로부터 얻거나 직접 내용을 채우면 된다.
+
+`send()`처럼, `sendto()` 또한 송신한 바이트 수를 반환(보내라고 한 것보다 적을 수 있다!)하고, 오류가 발생했을 때에는 `-1`를 반환한다.
+
+### `recvfrom()`
+
+```c
+int recvfrom(int sockfd, void* buf, int len, unsigned int flags,
+             struct sockaddr* from, int* fromlen);
+```
+
+- 두 개의 인자가 추가된 `recv()`와 같다.
+- `from`: 송신 기기의 IP 주소와 포트로 채워질 로컬 `struct sockaddr_storage`의 포인터
+- `fromlen`: `sizeof* from` 또는 `sizeof(struct sockaddr_storage)`로 초기화 되어야 하는 지역 `int` 변수의 포인터
+  - 함수가 반환될 때, `fromlen`은 `from`에 저장된 실제 길이를 가지게 된다.
+
+`recvfrom()`은 수신된 바이트 수를 반환하거나 오류가 발생했을 때에는 `errno`를 설정하고 `-1`을 반환한다.
+
+### 왜 `struct sockaddr_storage`인가?
+
+왜 소켓 타입으로 `struct sockaddr_in`이 아니라 `struct sockaddr_storage`을 사용할까?  
+:arrow_right: IPv4 또는 IPv6으로 한정하지 않기 위해 제네릭한 `struct sockaddr_storage`를 사용한다.
+
+데이터그램 소켓을 `connect()`할 때에는 모든 통신에 간단히 `send()`와 `recv()`를 사용하면 된다. 소켓 자체는 여전히 데이터그램 소켓이며, 패킷은 여전히 UDP를 사용하지만 소켓 인터페이스가 자동으로 수신지와 발신지 정보를 추가할 것이다.
+
+## `close()`, `shutdown()` - 저리 가!
+
+일반적인 유닉스 파일 기술자 `close()` 함수를 사용한다.
+
+```c
+close(sockfd);
+```
+
+이렇게 하면 소켓에서 더이상 읽기나 쓰기를 할 수 없게 된다. 원격 측에서 소켓에 읽기나 쓰기 작업을 시도하면 오류가 발생할 것이다.
+
+소켓이 어떻게 닫히는가를 좀 더 제어하고 싶다면 `shutdown()` 함수를 사용한다. 이는 `close()`처럼 양방향으로 통신을 끊거나, 특정 방향의 통신을 끊을 수 있게 해준다.
+
+```c
+int shutdown(int sockfd, int how);
+```
+
+- `sockfd`: 닫으려는 소켓 파일 기술자
+- `how`: 다음 중 하나
+  | `how` | 효과 |
+  | --- | --- |
+  | `0` | 이후 수신 불가 |
+  | `1` | 이후 송신 불가 |
+  | `2` | 이후 송신과 수신 불가 |
+- `shutdown`은 성공하면 `0`, 오류가 발생하면 `errno`를 설정하고 `-1`을 반환한다.
+
+비연결 데이터그램 소켓에 `shutdown()`을 쓰면 단순히 소켓이 `send()`나 `recv()`를 호출하지 못하게 된다. (데이터그램 소켓에 `connect()`를 사용하면 이 함수들을 사용할 수 있다.)
+
+`shutdown()`은 실제로 파일 기술자를 닫지 않는다. 그저 사용성을 변경할 뿐이다. 소켓 기술자를 해제하려면 `close()`를 사용해야 한다.
+
+(Windows와 Winsock를 사용한다면 `close()` 대신 `closesocket()`을 사용한다.)
+
+## `getpeername()` - 누구세요?
+
+연결된 스트림 소켓의 반대편에 누가 있는지를 알려준다.
+
+```c
+#include <sys/socket.h>
+
+int getpeername(int sockfd, struct sockaddr* addr, int* addrlen);
+```
+
+- `sockfd`: 연결된 스트림 소켓의 기술자
+- `addr`: 연결 상대의 정보를 가지는 `struct sockaddr` 또는 `struct sockaddr_in`의 포인터
+- `addrlen`: `sizeof* addr` 또는 `sizeof(struct sockaddr)`로 초기화되어야 하는 `int`의 포인터
+- 오류가 발생하면 `errno`를 설정하고 `-1`을 반환한다.
+
+일단 주소를 얻게 되면 정보를 출력하거나 더 많은 정보를 얻기 위해 `inet_ntop()`, `getnameinfo()` 또는 `gethostbyaddr()`를 사용할 수 있다.
+
+## `gethostname()` - 내가 누구게?
+
+프로그램이 실행 중인 컴퓨터의 이름을 반환한다. 그 이름은 로컬 기기의 IP 주소를 결정하기 위해 `getaddrinfo()`에서 사용할 수 있다.
+
+```c
+#include <unistd.h>
+
+int gethostname(char* hostname, size_t size);
+```
+
+- `hostname`: 함수가 반환될 때 호스트 이름을 저장하게 될 문자 배열의 포인터
+- `size`: `hostname` 배열의 바이트 길이
+- 성공하면 `0`, 오류가 발생하면 `errno`를 설정하고 `-1`을 반환한다.
