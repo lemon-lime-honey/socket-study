@@ -357,3 +357,253 @@ int main(void)
     return 0;
 }
 ```
+
+## `select()` - 동기 I/O 멀티플렉싱, 옛 방식
+
+```c
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+int select(int numfds, fd_set* readfds, fd_set* writefds,
+           fd_set* expectfds, struct timeval* timeout);
+```
+
+- 이 함수는 파일 기술자의 "집합", 정확히는 `readfds`, `writefds`, `exceptfds`를 모니터링한다.
+- 만약 표준 입력과 `sockfd`라는 소켓 기술자로부터 읽기를 할 수 있는지 확인하고 싶다면 파일 기술자 `0`과 `sockfd`를 집합 `readfds`에 추가한다.
+- 인자 `numfds`는 가장 큰 파일 기술자 값에 1을 더한 값이어야 한다
+- `select()`가 반환할 때, `readfds`는 읽을 준비가 된 선택된 파일 기술자를 반영하도록 수정된다. 매크로 `FD_ISSET()`으로 시험해볼 수 있다.
+
+| 함수 | 설명 |
+| --- | --- |
+| `FD_SET(int fd, fd_set* set) | `set`에 `fd` 추가 |
+| `FD_CLR(int fd, fd_set* set) | `set`에서 `fd` 제거 |
+| `FD_ISSET(int fd, fd_set* set) | `fd`가 `set`에 있으면 참 반환 |
+| `FD_ZERO(fd_set* set) | `set` 비우기 |
+
+- `struct timeval* timeout`은 제한 시간을 나타낸다.
+
+```c
+struct timeval {
+  int tv_sec;  // seconds
+  int tv_usec; // microseconds
+}
+```
+
+- 함수가 반환할 때 `timeout`은 남은 시간으로 갱신될 수도 있다. 운영체제에 따라 다르다.
+- `0`으로 설정하면 `select()`는 즉시 집합에서 모든 파일 기술자를 조사한다.
+- `NULL`로 설정하면 무기한으로 첫 번째 파일 기술자가 준비될 때까지 기다린다.
+
+```c
+/*
+** select.c -- a select() demo
+*/
+
+#include <stdio.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define STDIN 0  // file descriptor for standard input
+
+int main(void)
+{
+    struct timeval tv;
+    fd_set readfds;
+
+    tv.tv_sec = 2;
+    tv.tv_usec = 500000;
+
+    FD_ZERO(&readfds);
+    FD_SET(STDIN, &readfds);
+
+    // don't care about writefds and exceptfds:
+    select(STDIN+1, &readfds, NULL, NULL, &tv);
+
+    if (FD_ISSET(STDIN, &readfds))
+        printf("A key was pressed!\n");
+    else
+        printf("Timed out.\n");
+
+    return 0;
+} 
+```
+
+- 소켓이 연결을 끊는다면 `select()`는 그 소켓을 읽기 준비로 설정하며 반환한다. 해당 소켓에 `recv()`를 사용한다면 `0`을 반환할 것이므로, 이를 통해 클라이언트가 연결을 끊었다는 사실을 알 수 있다.
+- 소켓이 `listen()` 중이라면 `readfds` 집합에 그 소켓의 파일 기술자를 넣어 새로운 연결이 있는지 확인할 수 있다.
+
+- 다음 프로그램은 단순한 다중 사용자 채팅 서버처럼 동작한다.
+- 하나의 창에서 실행하고, 복수의 여러 다른 창에서 `telnet`한다.
+- `telnet hostname 9034`
+- 하나의 `telnet` 세션에서 무언가를 입력하면 다른 창에 나타날 것이다.
+
+```c
+/*
+** selectserver.c -- a cheezy multiperson chat server
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+#define PORT "9034"   // port we're listening on
+
+// get sockaddr, IPv4 or IPv6:
+void *get_in_addr(struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET) {
+        return &(((struct sockaddr_in*)sa)->sin_addr);
+    }
+
+    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+}
+
+int main(void)
+{
+    fd_set master;    // master file descriptor list
+    fd_set read_fds;  // temp file descriptor list for select()
+    int fdmax;        // maximum file descriptor number
+
+    int listener;     // listening socket descriptor
+    int newfd;        // newly accept()ed socket descriptor
+    struct sockaddr_storage remoteaddr; // client address
+    socklen_t addrlen;
+
+    char buf[256];    // buffer for client data
+    int nbytes;
+
+    char remoteIP[INET6_ADDRSTRLEN];
+
+    int yes=1;        // for setsockopt() SO_REUSEADDR, below
+    int i, j, rv;
+
+    struct addrinfo hints, *ai, *p;
+
+    FD_ZERO(&master);    // clear the master and temp sets
+    FD_ZERO(&read_fds);
+
+    // get us a socket and bind it
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    if ((rv = getaddrinfo(NULL, PORT, &hints, &ai)) != 0) {
+        fprintf(stderr, "selectserver: %s\n", gai_strerror(rv));
+        exit(1);
+    }
+    
+    for(p = ai; p != NULL; p = p->ai_next) {
+        listener = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (listener < 0) { 
+            continue;
+        }
+        
+        // lose the pesky "address already in use" error message
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
+
+        if (bind(listener, p->ai_addr, p->ai_addrlen) < 0) {
+            close(listener);
+            continue;
+        }
+
+        break;
+    }
+
+    // if we got here, it means we didn't get bound
+    if (p == NULL) {
+        fprintf(stderr, "selectserver: failed to bind\n");
+        exit(2);
+    }
+
+    freeaddrinfo(ai); // all done with this
+
+    // listen
+    if (listen(listener, 10) == -1) {
+        perror("listen");
+        exit(3);
+    }
+
+    // add the listener to the master set
+    FD_SET(listener, &master);
+
+    // keep track of the biggest file descriptor
+    fdmax = listener; // so far, it's this one
+
+    // main loop
+    for(;;) {
+        read_fds = master; // copy it
+        if (select(fdmax+1, &read_fds, NULL, NULL, NULL) == -1) {
+            perror("select");
+            exit(4);
+        }
+
+        // run through the existing connections looking for data to read
+        for(i = 0; i <= fdmax; i++) {
+            if (FD_ISSET(i, &read_fds)) { // we got one!!
+                if (i == listener) {
+                    // handle new connections
+                    addrlen = sizeof remoteaddr;
+                    newfd = accept(listener,
+                        (struct sockaddr *)&remoteaddr,
+                        &addrlen);
+
+                    if (newfd == -1) {
+                        perror("accept");
+                    } else {
+                        FD_SET(newfd, &master); // add to master set
+                        if (newfd > fdmax) {    // keep track of the max
+                            fdmax = newfd;
+                        }
+                        printf("selectserver: new connection from %s on "
+                            "socket %d\n",
+                            inet_ntop(remoteaddr.ss_family,
+                                get_in_addr((struct sockaddr*)&remoteaddr),
+                                remoteIP, INET6_ADDRSTRLEN),
+                            newfd);
+                    }
+                } else {
+                    // handle data from a client
+                    if ((nbytes = recv(i, buf, sizeof buf, 0)) <= 0) {
+                        // got error or connection closed by client
+                        if (nbytes == 0) {
+                            // connection closed
+                            printf("selectserver: socket %d hung up\n", i);
+                        } else {
+                            perror("recv");
+                        }
+                        close(i); // bye!
+                        FD_CLR(i, &master); // remove from master set
+                    } else {
+                        // we got some data from a client
+                        for(j = 0; j <= fdmax; j++) {
+                            // send to everyone!
+                            if (FD_ISSET(j, &master)) {
+                                // except the listener and ourselves
+                                if (j != listener && j != i) {
+                                    if (send(j, buf, nbytes, 0) == -1) {
+                                        perror("send");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } // END handle data from client
+            } // END got new incoming connection
+        } // END looping through file descriptors
+    } // END for(;;)--and you thought it would never end!
+    
+    return 0;
+}
+```
+
+- `master`: 새로운 연결을 위해 listen 중인 소켓 기줄자 뿐만이 아니라 현재 연결된 모든 소켓 기술자를 포함한다.
+  - `select()`는 읽을 준비가 된 소켓을 반영해 전달한 집합은 *변화*시키기 때문에 생성
+  - `select()`를 호출할 때마다 연결을 추적해야 하기 때문에 원본을 어딘가에 저장해야 했다.
+  - `master`를 `read_fds`로 복사하고 `select()`를 호출했다.
+  - 새로운 연결이 생길 때마다 `master` 집합에 추가해야 하고, 연결이 닫힐 때마다 `master` 집합에서 제거해야 한다.
