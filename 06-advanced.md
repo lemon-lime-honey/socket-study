@@ -607,3 +607,1462 @@ int main(void)
   - `select()`를 호출할 때마다 연결을 추적해야 하기 때문에 원본을 어딘가에 저장해야 했다.
   - `master`를 `read_fds`로 복사하고 `select()`를 호출했다.
   - 새로운 연결이 생길 때마다 `master` 집합에 추가해야 하고, 연결이 닫힐 때마다 `master` 집합에서 제거해야 한다.
+
+## 부분적인 `send()` 다루기
+
+[이 부분](./04-call.md/#send-recv---말을-좀-해봐)에서 `send()`가 요청한 바이트를 전부 전송하지 않을 수도 있다고 언급했다. 그렇다면 나머지 바이트에는 무슨 일이 생기는가?
+
+송신을 기다리는 버퍼에 여전히 남아있다. 제어할 수 있는 범위 밖의 상황 때문에, 커널은 모든 데이터를 한 묶음으로 보내지 않기로 결정했고, 남은 데이터를 가져오는 건 당신에게 달렸다/
+
+이러한 함수를 작성할 수 있다:
+
+```c
+#include <sys/types.h>
+#include <sys/socket.h>
+
+int sendall(int s, char *buf, int *len)
+{
+    int total = 0;        // how many bytes we've sent
+    int bytesleft = *len; // how many we have left to send
+    int n;
+
+    while(total < *len) {
+        n = send(s, buf+total, bytesleft, 0);
+        if (n == -1) { break; }
+        total += n;
+        bytesleft -= n;
+    }
+
+    *len = total; // return number actually sent here
+
+    return n==-1?-1:0; // return -1 on failure, 0 on success
+} 
+```
+
+- `s`: 데이터의 목적지 소켓
+- `buf`: 데이터를 가지고 있는 버퍼
+- `len`: 버퍼에 있는 데이터의 바이트 크기를 포함하는 `int`의 포인터
+- 이 함수는 오류가 발생했을 때 `errno`를 설정하고 `-1`을 반환한다.
+- 실제로 송신된 바이트 수는 `len`에 담겨 반환된다.
+  - 오류가 발생하지 않았다면 송신을 요청한 바이트 크기와 같다.
+
+다음은 함수 호출 예시이다.
+
+```c
+char buf[10] = "Anakin!";
+int len;
+
+len = strlen(buf);
+if (sendall(s, buf, &len) == -1) {
+  perror("sendall");
+  printf("We only sent %d bytes because of the error!\n", len);
+}
+```
+
+- 패킷 일부가 도착했을 때 수신 측은?
+- 패킷이 가변 길이를 가진다면 수신자는 하나의 패킷이 언제 끝나고 다른 패킷이 언제 시작하는지 어떻게 알 수 있는가?
+
+:arrow_right: *캡슐화*를 해야 할 수도...
+
+## 직렬화 - 데이터를 패킹하는 법
+
+문자열이 아니라 `int` 또는 `float`같은 이진 데이터를 보내려면 다음과 같은 방법이 가능하다.
+
+1. `sprintf()` 같은 함수를 이용해 숫자를 문자열로 변환한 후 그 문자열을 송신한다. 수신 측은 `strtol()`과 같은 함수를 사용해 문자열을 다시 숫자로 파싱할 것이다.
+2. `send()`에 데이터를 가리키는 포인터를 전달해 그냥 데이터 자체를 보낸다.
+3. 이식성이 있는 이진 형식으로 숫자를 인코딩한다. 수신 측에서 디코딩한다.
+
+(사실 이걸 실행하게 해주는 라이브러리들이 있다.)
+
+사실 위의 세 방법 모두 장단점이 있지만 이 문서의 원 저자는 보통 세 번째 방법을 선호한다.
+
+1. 첫 번째 방법
+
+    - 선을 통해 들어오는 데이터를 쉽게 출력해 읽을 수 있다는 장점이 있다.
+    - 때로 인간이 읽을 수 있는 프로토콜은 IRC(Internet Relay Chat) 같은 non-bandwidth-intensive 상황에서 사용하기 좋다.
+    - 그러나 변환에 시간이 걸린다는 것과, 결과가 거의 언제나 원래 값보다 더 많은 공간을 차지한다는 단점이 있다.
+
+2. 두 번째 방법
+
+    - 쉽다.
+    - 그냥 보낼 데이터의 포인터를 보낸다.
+
+        ```c
+        double d = 3490.15926535;
+
+        send(s, &d, sizeof d, 0); /* DANGER--non-portable! */
+        ```
+
+    - 수신 측은 이걸 다음과 같이 받는다.
+
+        ```c
+        double d;
+
+        recv(s, &d, sizeof d, 0); /* DANGER--non-portable! */
+        ```
+
+    - 쉽고, 단순하다.
+    - 모든 아키텍처가 `double`(또는 `int`)를 같은 비트 표현으로 나타내거나 같은 바이트 순서를 가지지는 않는다.
+    - 이 코드는 확실히 이식성이 없다.
+
+3. 세 번째 방법
+
+    - 데이터를 알려진 형식으로 패킹한 다음 그 결과를 보낸다.
+    - 다음은 `float`를 패킹하는 방법의 예시이다.
+
+        ```c
+        #include <stdint.h>
+
+        uint32_t htonf(float f)
+        {
+            uint32_t p;
+            uint32_t sign;
+
+            if (f < 0) { sign = 1; f = -f; }
+            else { sign = 0; }
+                
+            p = ((((uint32_t)f)&0x7fff)<<16) | (sign<<31); // whole part and sign
+            p |= (uint32_t)(((f - (int)f) * 65536.0f))&0xffff; // fraction
+
+            return p;
+        }
+
+        float ntohf(uint32_t p)
+        {
+            float f = ((p>>16)&0x7fff); // whole part
+            f += (p&0xffff) / 65536.0f; // fraction
+
+            if (((p>>31)&0x1) == 0x1) { f = -f; } // sign bit set
+
+            return f;
+        }
+        ```
+
+    - 위의 코드는 `float`를 32비트 숫자에 저장하는 일종의 naive한 구현이다.
+    - 최상위 비트(31)은 숫자의 부호("1"은 음수를 뜻함)를 저장하는데 사용되고, 그 다음 7개의 비트(30-16)은 `float`의 정수부를, 나머지 비트(15-0)은 소수부를 저장하는데 사용된다.
+
+        ```c
+        #include <stdio.h>
+
+        int main(void)
+        {
+            float f = 3.1415926, f2;
+            uint32_t netf;
+
+            netf = htonf(f);  // convert to "network" form
+            f2 = ntohf(netf); // convert back to test
+
+            printf("Original: %f\n", f);        // 3.141593
+            printf(" Network: 0x%08X\n", netf); // 0x0003243F
+            printf("Unpacked: %f\n", f2);       // 3.141586
+
+            return 0;
+        }
+        ```
+
+    - 장점: 작고, 단순하고, 빠르다.
+    - 단점: 공간을 효율적으로 활용하지 못하며, 범위가 심각하게 제한된다.
+      - 위의 예시에서 마지막 두 자리는 정확하게 보존되지 않는다는 점을 알 수 있다.
+
+- 다른 방법? 부동 소수점 숫자를 저장하는 표준은 `IEEE-754`로 알려져있다. 대부분은 부동 소수점 계산을 할 때 내부에서 이 형식을 사용하며, 그런 경우에, 엄밀히 말해서 변환을 할 필요는 없다.
+- 그러나 소스코드가 이식성이 있기를 바란다면 그런 가정을 할 수 없다.
+  - 한 편으로는, 속도가 중요하다면 변환이 필요없는 플랫폼에서는 이 과정을 제거하는 최적화를 해야한다. 그것이 바로 `htons()`와 유사한 함수들이 하는 일이다.
+
+- 다음은 `IEEE-754` 형식으로 `float`와 `double`을 인코딩하는 예제이다. (대부분-NaN이나 Infinity는 인코딩하지 않지만, 그를 위해 변경될 수 있다.)
+
+    ```c
+    #define pack754_32(f) (pack754((f), 32, 8))
+    #define pack754_64(f) (pack754((f), 64, 11))
+    #define unpack754_32(i) (unpack754((i), 32, 8))
+    #define unpack754_64(i) (unpack754((i), 64, 11))
+
+    uint64_t pack754(long double f, unsigned bits, unsigned expbits)
+    {
+        long double fnorm;
+        int shift;
+        long long sign, exp, significand;
+        unsigned significandbits = bits - expbits - 1; // -1 for sign bit
+
+        if (f == 0.0) return 0; // get this special case out of the way
+
+        // check sign and begin normalization
+        if (f < 0) { sign = 1; fnorm = -f; }
+        else { sign = 0; fnorm = f; }
+
+        // get the normalized form of f and track the exponent
+        shift = 0;
+        while(fnorm >= 2.0) { fnorm /= 2.0; shift++; }
+        while(fnorm < 1.0) { fnorm *= 2.0; shift--; }
+        fnorm = fnorm - 1.0;
+
+        // calculate the binary form (non-float) of the significand data
+        significand = fnorm * ((1LL<<significandbits) + 0.5f);
+
+        // get the biased exponent
+        exp = shift + ((1<<(expbits-1)) - 1); // shift + bias
+
+        // return the final answer
+        return (sign<<(bits-1)) | (exp<<(bits-expbits-1)) | significand;
+    }
+
+    long double unpack754(uint64_t i, unsigned bits, unsigned expbits)
+    {
+        long double result;
+        long long shift;
+        unsigned bias;
+        unsigned significandbits = bits - expbits - 1; // -1 for sign bit
+
+        if (i == 0) return 0.0;
+
+        // pull the significand
+        result = (i&((1LL<<significandbits)-1)); // mask
+        result /= (1LL<<significandbits); // convert back to float
+        result += 1.0f; // add the one back on
+
+        // deal with the exponent
+        bias = (1<<(expbits-1)) - 1;
+        shift = ((i>>significandbits)&((1LL<<expbits)-1)) - bias;
+        while(shift > 0) { result *= 2.0; shift--; }
+        while(shift < 0) { result /= 2.0; shift++; }
+
+        // sign it
+        result *= (i>>(bits-1))&1? -1.0: 1.0;
+
+        return result;
+    }
+    ```
+
+상단에 32비트(아마도 `float`)와 64비트(아마도 `double`) 숫자를 패킹하고 언패킹하는 매크로를 추가했지만, `pack754()` 함수를 직접 불러 `bit` 크기의 데이터를 인코딩할 수도 있다.(`expbits`만큼의 지수부가 보존될 것이다.)
+
+다음은 예제이다.
+
+```c
+#include <stdio.h>
+#include <stdint.h> // defines uintN_t types
+#include <inttypes.h> // defines PRIx macros
+
+int main(void)
+{
+    float f = 3.1415926, f2;
+    double d = 3.14159265358979323, d2;
+    uint32_t fi;
+    uint64_t di;
+
+    fi = pack754_32(f);
+    f2 = unpack754_32(fi);
+
+    di = pack754_64(d);
+    d2 = unpack754_64(di);
+
+    printf("float before : %.7f\n", f);
+    printf("float encoded: 0x%08" PRIx32 "\n", fi);
+    printf("float after  : %.7f\n\n", f2);
+
+    printf("double before : %.20lf\n", d);
+    printf("double encoded: 0x%016" PRIx64 "\n", di);
+    printf("double after  : %.20lf\n", d2);
+
+    return 0;
+}
+```
+
+위의 코드는 다음과 같은 결과를 산출한다.
+
+```text
+float before : 3.1415925
+float encoded: 0x40490FDA
+float after  : 3.1415925
+
+double before : 3.14159265358979311600
+double encoded: 0x400921FB54442D18
+double after  : 3.14159265358979311600
+```
+
+- `struct`를 패킹할 수 있을까?
+- 불행히도, 컴파일러는 `struct`의 모든 곳에 자유롭게 패딩을 추가할 수 있고, 그것은 구조체 전체를 한 덩이로 보낼 수 없다는 것을 의미한다.
+- `struct`를 전송하는 가장 좋은 방법은 각각의 필드를 독립적으로 패킹한 다음 반대쪽에 도착했을 때 `struct` 안으로 언팩하는 것이다.
+
+Kernighan과 Pike의 `The Practice of Programming`에서, 그들은 `pack()`와 `unpack()`이라 불리는 정확히 이런 동작을 하는 `printf()`와 유사한 함수를 구현한다.
+
+다음은 이 문서의 저자가 K&P의 방법을 변경한 코드이다.
+
+<details>
+<summary>펼쳐서 확인하기</summary>
+
+
+<details>
+<summary>`pack754()` 함수</summary>
+
+```c
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+// macros for packing floats and doubles:
+#define pack754_16(f) (pack754((f), 16, 5))
+#define pack754_32(f) (pack754((f), 32, 8))
+#define pack754_64(f) (pack754((f), 64, 11))
+#define unpack754_16(i) (unpack754((i), 16, 5))
+#define unpack754_32(i) (unpack754((i), 32, 8))
+#define unpack754_64(i) (unpack754((i), 64, 11))
+
+/*
+** pack754() -- pack a floating point number into IEEE-754 format
+*/
+unsigned long long int pack754(long double f, unsigned bits, unsigned expbits) {
+  long double fnorm;
+  int shift;
+  long long sign, exp, significand;
+  unsigned significandbits = bits - expbits - 1;  // -1 for sign bit
+
+  if (f == 0.0) return 0;  // get this special case out of the way
+
+  // check sign and begin normalization
+  if (f < 0) {
+    sign = 1;
+    fnorm = -f;
+  } else {
+    sign = 0;
+    fnorm = f;
+  }
+
+  // get the normalized form of f and track the exponent
+  shift = 0;
+  while (fnorm >= 2.0) {
+    fnorm /= 2.0;
+    shift++;
+  }
+  while (fnorm < 1.0) {
+    fnorm *= 2.0;
+    shift--;
+  }
+  fnorm = fnorm - 1.0;
+
+  // calculate the binary form (non-float) of the significand data
+  significand = fnorm * ((1LL << significandbits) + 0.5f);
+
+  // get the biased exponent
+  exp = shift + ((1 << (expbits - 1)) - 1);  // shift + bias
+
+  // return the final answer
+  return (sign << (bits - 1)) | (exp << (bits - expbits - 1)) | significand;
+}
+
+/*
+** unpack754() -- unpack a floating point number from IEEE-754 format
+*/
+long double unpack754(unsigned long long int i, unsigned bits,
+                      unsigned expbits) {
+  long double result;
+  long long shift;
+  unsigned bias;
+  unsigned significandbits = bits - expbits - 1;  // -1 for sign bit
+
+  if (i == 0) return 0.0;
+
+  // pull the significand
+  result = (i & ((1LL << significandbits) - 1));  // mask
+  result /= (1LL << significandbits);             // convert back to float
+  result += 1.0f;                                 // add the one back on
+
+  // deal with the exponent
+  bias = (1 << (expbits - 1)) - 1;
+  shift = ((i >> significandbits) & ((1LL << expbits) - 1)) - bias;
+  while (shift > 0) {
+    result *= 2.0;
+    shift--;
+  }
+  while (shift < 0) {
+    result /= 2.0;
+    shift++;
+  }
+
+  // sign it
+  result *= (i >> (bits - 1)) & 1 ? -1.0 : 1.0;
+
+  return result;
+}
+
+/*
+** packi16() -- store a 16-bit int into a char buffer (like htons())
+*/
+void packi16(unsigned char *buf, unsigned int i) {
+  *buf++ = i >> 8;
+  *buf++ = i;
+}
+
+/*
+** packi32() -- store a 32-bit int into a char buffer (like htonl())
+*/
+void packi32(unsigned char *buf, unsigned long int i) {
+  *buf++ = i >> 24;
+  *buf++ = i >> 16;
+  *buf++ = i >> 8;
+  *buf++ = i;
+}
+
+/*
+** packi64() -- store a 64-bit int into a char buffer (like htonl())
+*/
+void packi64(unsigned char *buf, unsigned long long int i) {
+  *buf++ = i >> 56;
+  *buf++ = i >> 48;
+  *buf++ = i >> 40;
+  *buf++ = i >> 32;
+  *buf++ = i >> 24;
+  *buf++ = i >> 16;
+  *buf++ = i >> 8;
+  *buf++ = i;
+}
+
+/*
+** unpacki16() -- unpack a 16-bit int from a char buffer (like ntohs())
+*/
+int unpacki16(unsigned char *buf) {
+  unsigned int i2 = ((unsigned int)buf[0] << 8) | buf[1];
+  int i;
+
+  // change unsigned numbers to signed
+  if (i2 <= 0x7fffu) {
+    i = i2;
+  } else {
+    i = -1 - (unsigned int)(0xffffu - i2);
+  }
+
+  return i;
+}
+
+/*
+** unpacku16() -- unpack a 16-bit unsigned from a char buffer (like ntohs())
+*/
+unsigned int unpacku16(unsigned char *buf) {
+  return ((unsigned int)buf[0] << 8) | buf[1];
+}
+
+/*
+** unpacki32() -- unpack a 32-bit int from a char buffer (like ntohl())
+*/
+long int unpacki32(unsigned char *buf) {
+  unsigned long int i2 = ((unsigned long int)buf[0] << 24) |
+                         ((unsigned long int)buf[1] << 16) |
+                         ((unsigned long int)buf[2] << 8) | buf[3];
+  long int i;
+
+  // change unsigned numbers to signed
+  if (i2 <= 0x7fffffffu) {
+    i = i2;
+  } else {
+    i = -1 - (long int)(0xffffffffu - i2);
+  }
+
+  return i;
+}
+
+/*
+** unpacku32() -- unpack a 32-bit unsigned from a char buffer (like ntohl())
+*/
+unsigned long int unpacku32(unsigned char *buf) {
+  return ((unsigned long int)buf[0] << 24) | ((unsigned long int)buf[1] << 16) |
+         ((unsigned long int)buf[2] << 8) | buf[3];
+}
+
+/*
+** unpacki64() -- unpack a 64-bit int from a char buffer (like ntohl())
+*/
+long long int unpacki64(unsigned char *buf) {
+  unsigned long long int i2 = ((unsigned long long int)buf[0] << 56) |
+                              ((unsigned long long int)buf[1] << 48) |
+                              ((unsigned long long int)buf[2] << 40) |
+                              ((unsigned long long int)buf[3] << 32) |
+                              ((unsigned long long int)buf[4] << 24) |
+                              ((unsigned long long int)buf[5] << 16) |
+                              ((unsigned long long int)buf[6] << 8) | buf[7];
+  long long int i;
+
+  // change unsigned numbers to signed
+  if (i2 <= 0x7fffffffffffffffu) {
+    i = i2;
+  } else {
+    i = -1 - (long long int)(0xffffffffffffffffu - i2);
+  }
+
+  return i;
+}
+
+/*
+** unpacku64() -- unpack a 64-bit unsigned from a char buffer (like ntohl())
+*/
+unsigned long long int unpacku64(unsigned char *buf) {
+  return ((unsigned long long int)buf[0] << 56) |
+         ((unsigned long long int)buf[1] << 48) |
+         ((unsigned long long int)buf[2] << 40) |
+         ((unsigned long long int)buf[3] << 32) |
+         ((unsigned long long int)buf[4] << 24) |
+         ((unsigned long long int)buf[5] << 16) |
+         ((unsigned long long int)buf[6] << 8) | buf[7];
+}
+
+/*
+** pack() -- store data dictated by the format string in the buffer
+**
+**   bits |signed   unsigned   float   string
+**   -----+----------------------------------
+**      8 |   c        C
+**     16 |   h        H         f
+**     32 |   l        L         d
+**     64 |   q        Q         g
+**      - |                               s
+**
+**  (16-bit unsigned length is automatically prepended to strings)
+*/
+
+unsigned int pack(unsigned char *buf, char *format, ...) {
+  va_list ap;
+
+  signed char c;  // 8-bit
+  unsigned char C;
+
+  int h;  // 16-bit
+  unsigned int H;
+
+  long int l;  // 32-bit
+  unsigned long int L;
+
+  long long int q;  // 64-bit
+  unsigned long long int Q;
+
+  float f;  // floats
+  double d;
+  long double g;
+  unsigned long long int fhold;
+
+  char *s;  // strings
+  unsigned int len;
+
+  unsigned int size = 0;
+
+  va_start(ap, format);
+
+  for (; *format != '\0'; format++) {
+    switch (*format) {
+      case 'c':  // 8-bit
+        size += 1;
+        c = (signed char)va_arg(ap, int);  // promoted
+        *buf++ = c;
+        break;
+
+      case 'C':  // 8-bit unsigned
+        size += 1;
+        C = (unsigned char)va_arg(ap, unsigned int);  // promoted
+        *buf++ = C;
+        break;
+
+      case 'h':  // 16-bit
+        size += 2;
+        h = va_arg(ap, int);
+        packi16(buf, h);
+        buf += 2;
+        break;
+
+      case 'H':  // 16-bit unsigned
+        size += 2;
+        H = va_arg(ap, unsigned int);
+        packi16(buf, H);
+        buf += 2;
+        break;
+
+      case 'l':  // 32-bit
+        size += 4;
+        l = va_arg(ap, long int);
+        packi32(buf, l);
+        buf += 4;
+        break;
+
+      case 'L':  // 32-bit unsigned
+        size += 4;
+        L = va_arg(ap, unsigned long int);
+        packi32(buf, L);
+        buf += 4;
+        break;
+
+      case 'q':  // 64-bit
+        size += 8;
+        q = va_arg(ap, long long int);
+        packi64(buf, q);
+        buf += 8;
+        break;
+
+      case 'Q':  // 64-bit unsigned
+        size += 8;
+        Q = va_arg(ap, unsigned long long int);
+        packi64(buf, Q);
+        buf += 8;
+        break;
+
+      case 'f':  // float-16
+        size += 2;
+        f = (float)va_arg(ap, double);  // promoted
+        fhold = pack754_16(f);          // convert to IEEE 754
+        packi16(buf, fhold);
+        buf += 2;
+        break;
+
+      case 'd':  // float-32
+        size += 4;
+        d = va_arg(ap, double);
+        fhold = pack754_32(d);  // convert to IEEE 754
+        packi32(buf, fhold);
+        buf += 4;
+        break;
+
+      case 'g':  // float-64
+        size += 8;
+        g = va_arg(ap, long double);
+        fhold = pack754_64(g);  // convert to IEEE 754
+        packi64(buf, fhold);
+        buf += 8;
+        break;
+
+      case 's':  // string
+        s = va_arg(ap, char *);
+        len = strlen(s);
+        size += len + 2;
+        packi16(buf, len);
+        buf += 2;
+        memcpy(buf, s, len);
+        buf += len;
+        break;
+    }
+  }
+
+  va_end(ap);
+
+  return size;
+}
+
+/*
+** unpack() -- unpack data dictated by the format string into the buffer
+**
+**   bits |signed   unsigned   float   string
+**   -----+----------------------------------
+**      8 |   c        C
+**     16 |   h        H         f
+**     32 |   l        L         d
+**     64 |   q        Q         g
+**      - |                               s
+**
+**  (string is extracted based on its stored length, but 's' can be
+**  prepended with a max length)
+*/
+void unpack(unsigned char *buf, char *format, ...) {
+  va_list ap;
+
+  signed char *c;  // 8-bit
+  unsigned char *C;
+
+  int *h;  // 16-bit
+  unsigned int *H;
+
+  long int *l;  // 32-bit
+  unsigned long int *L;
+
+  long long int *q;  // 64-bit
+  unsigned long long int *Q;
+
+  float *f;  // floats
+  double *d;
+  long double *g;
+  unsigned long long int fhold;
+
+  char *s;
+  unsigned int len, maxstrlen = 0, count;
+
+  va_start(ap, format);
+
+  for (; *format != '\0'; format++) {
+    switch (*format) {
+      case 'c':  // 8-bit
+        c = va_arg(ap, signed char *);
+        if (*buf <= 0x7f) {
+          *c = *buf;
+        }  // re-sign
+        else {
+          *c = -1 - (unsigned char)(0xffu - *buf);
+        }
+        buf++;
+        break;
+
+      case 'C':  // 8-bit unsigned
+        C = va_arg(ap, unsigned char *);
+        *C = *buf++;
+        break;
+
+      case 'h':  // 16-bit
+        h = va_arg(ap, int *);
+        *h = unpacki16(buf);
+        buf += 2;
+        break;
+
+      case 'H':  // 16-bit unsigned
+        H = va_arg(ap, unsigned int *);
+        *H = unpacku16(buf);
+        buf += 2;
+        break;
+
+      case 'l':  // 32-bit
+        l = va_arg(ap, long int *);
+        *l = unpacki32(buf);
+        buf += 4;
+        break;
+
+      case 'L':  // 32-bit unsigned
+        L = va_arg(ap, unsigned long int *);
+        *L = unpacku32(buf);
+        buf += 4;
+        break;
+
+      case 'q':  // 64-bit
+        q = va_arg(ap, long long int *);
+        *q = unpacki64(buf);
+        buf += 8;
+        break;
+
+      case 'Q':  // 64-bit unsigned
+        Q = va_arg(ap, unsigned long long int *);
+        *Q = unpacku64(buf);
+        buf += 8;
+        break;
+
+      case 'f':  // float
+        f = va_arg(ap, float *);
+        fhold = unpacku16(buf);
+        *f = unpack754_16(fhold);
+        buf += 2;
+        break;
+
+      case 'd':  // float-32
+        d = va_arg(ap, double *);
+        fhold = unpacku32(buf);
+        *d = unpack754_32(fhold);
+        buf += 4;
+        break;
+
+      case 'g':  // float-64
+        g = va_arg(ap, long double *);
+        fhold = unpacku64(buf);
+        *g = unpack754_64(fhold);
+        buf += 8;
+        break;
+
+      case 's':  // string
+        s = va_arg(ap, char *);
+        len = unpacku16(buf);
+        buf += 2;
+        if (maxstrlen > 0 && len > maxstrlen)
+          count = maxstrlen - 1;
+        else
+          count = len;
+        memcpy(s, buf, count);
+        s[count] = '\0';
+        buf += len;
+        break;
+
+      default:
+        if (isdigit(*format)) {  // track max str len
+          maxstrlen = maxstrlen * 10 + (*format - '0');
+        }
+    }
+
+    if (!isdigit(*format)) maxstrlen = 0;
+  }
+
+  va_end(ap);
+}
+
+// #define DEBUG
+#ifdef DEBUG
+#include <assert.h>
+#include <float.h>
+#include <limits.h>
+#endif
+
+int main(void) {
+#ifndef DEBUG
+  unsigned char buf[1024];
+  unsigned char magic;
+  int monkeycount;
+  long altitude;
+  double absurdityfactor;
+  char *s = "Great unmitigated Zot!  You've found the Runestaff!";
+  char s2[96];
+  unsigned int packetsize, ps2;
+
+  packetsize = pack(buf, "CHhlsd", 'B', 0, 37, -5, s, -3490.5);
+  packi16(buf + 1, packetsize);  // store packet size in packet for kicks
+
+  printf("packet is %u bytes\n", packetsize);
+
+  unpack(buf, "CHhl96sd", &magic, &ps2, &monkeycount, &altitude, s2,
+         &absurdityfactor);
+
+  printf("'%c' %hhu %u %ld \"%s\" %f\n", magic, ps2, monkeycount, altitude, s2,
+         absurdityfactor);
+
+#else
+  unsigned char buf[1024];
+
+  int x;
+
+  long long k, k2;
+  long long test64[14] = {0,
+                          -0,
+                          1,
+                          2,
+                          -1,
+                          -2,
+                          0x7fffffffffffffffll >> 1,
+                          0x7ffffffffffffffell,
+                          0x7fffffffffffffffll,
+                          -0x7fffffffffffffffll,
+                          -0x8000000000000000ll,
+                          9007199254740991ll,
+                          9007199254740992ll,
+                          9007199254740993ll};
+
+  unsigned long long K, K2;
+  unsigned long long testu64[14] = {0,
+                                    0,
+                                    1,
+                                    2,
+                                    0,
+                                    0,
+                                    0xffffffffffffffffll >> 1,
+                                    0xfffffffffffffffell,
+                                    0xffffffffffffffffll,
+                                    0,
+                                    0,
+                                    9007199254740991ll,
+                                    9007199254740992ll,
+                                    9007199254740993ll};
+
+  long i, i2;
+  long test32[14] = {0,
+                     -0,
+                     1,
+                     2,
+                     -1,
+                     -2,
+                     0x7fffffffl >> 1,
+                     0x7ffffffel,
+                     0x7fffffffl,
+                     -0x7fffffffl,
+                     -0x80000000l,
+                     0,
+                     0,
+                     0};
+
+  unsigned long I, I2;
+  unsigned long testu32[14] = {
+      0,           0,           1, 2, 0, 0, 0xffffffffl >> 1,
+      0xfffffffel, 0xffffffffl, 0, 0, 0, 0, 0};
+
+  int j, j2;
+  int test16[14] = {0,      -0,     1,       2,       -1, -2, 0x7fff >> 1,
+                    0x7ffe, 0x7fff, -0x7fff, -0x8000, 0,  0,  0};
+
+  printf("char bytes: %zu\n", sizeof(char));
+  printf("int bytes: %zu\n", sizeof(int));
+  printf("long bytes: %zu\n", sizeof(long));
+  printf("long long bytes: %zu\n", sizeof(long long));
+  printf("float bytes: %zu\n", sizeof(float));
+  printf("double bytes: %zu\n", sizeof(double));
+  printf("long double bytes: %zu\n", sizeof(long double));
+
+  for (x = 0; x < 14; x++) {
+    k = test64[x];
+    pack(buf, "q", k);
+    unpack(buf, "q", &k2);
+
+    if (k2 != k) {
+      printf("64: %lld != %lld\n", k, k2);
+      printf("  before: %016llx\n", k);
+      printf("  after:  %016llx\n", k2);
+      printf(
+          "  buffer: %02hhx %02hhx %02hhx %02hhx "
+          " %02hhx %02hhx %02hhx %02hhx\n",
+          buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+    } else {
+      // printf("64: OK: %lld == %lld\n", k, k2);
+    }
+
+    K = testu64[x];
+    pack(buf, "Q", K);
+    unpack(buf, "Q", &K2);
+
+    if (K2 != K) {
+      printf("64: %llu != %llu\n", K, K2);
+    } else {
+      // printf("64: OK: %llu == %llu\n", K, K2);
+    }
+
+    i = test32[x];
+    pack(buf, "l", i);
+    unpack(buf, "l", &i2);
+
+    if (i2 != i) {
+      printf("32(%d): %ld != %ld\n", x, i, i2);
+      printf("  before: %08lx\n", i);
+      printf("  after:  %08lx\n", i2);
+      printf(
+          "  buffer: %02hhx %02hhx %02hhx %02hhx "
+          " %02hhx %02hhx %02hhx %02hhx\n",
+          buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+    } else {
+      // printf("32: OK: %ld == %ld\n", i, i2);
+    }
+
+    I = testu32[x];
+    pack(buf, "L", I);
+    unpack(buf, "L", &I2);
+
+    if (I2 != I) {
+      printf("32(%d): %lu != %lu\n", x, I, I2);
+    } else {
+      // printf("32: OK: %lu == %lu\n", I, I2);
+    }
+
+    j = test16[x];
+    pack(buf, "h", j);
+    unpack(buf, "h", &j2);
+
+    if (j2 != j) {
+      printf("16: %d != %d\n", j, j2);
+    } else {
+      // printf("16: OK: %d == %d\n", j, j2);
+    }
+  }
+
+  if (1) {
+    long double testf64[8] = {-3490.6677,  0.0,         1.0,     -1.0,
+                              DBL_MIN * 2, DBL_MAX / 2, DBL_MIN, DBL_MAX};
+    long double f, f2;
+
+    for (i = 0; i < 8; i++) {
+      f = testf64[i];
+      pack(buf, "g", f);
+      unpack(buf, "g", &f2);
+
+      if (f2 != f) {
+        printf("f64: %Lf != %Lf\n", f, f2);
+        printf("  before: %016llx\n", *((long long *)&f));
+        printf("  after:  %016llx\n", *((long long *)&f2));
+        printf(
+            "  buffer: %02hhx %02hhx %02hhx %02hhx "
+            " %02hhx %02hhx %02hhx %02hhx\n",
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+      } else {
+        // printf("f64: OK: %f == %f\n", f, f2);
+      }
+    }
+  }
+  if (1) {
+    double testf32[7] = {0.0, 1.0, -1.0, 10, -3.6677, 3.1875, -3.1875};
+    double f, f2;
+
+    for (i = 0; i < 7; i++) {
+      f = testf32[i];
+      pack(buf, "d", f);
+      unpack(buf, "d", &f2);
+
+      if (f2 != f) {
+        printf("f32: %.10f != %.10f\n", f, f2);
+        printf("  before: %016llx\n", *((long long *)&f));
+        printf("  after:  %016llx\n", *((long long *)&f2));
+        printf(
+            "  buffer: %02hhx %02hhx %02hhx %02hhx "
+            " %02hhx %02hhx %02hhx %02hhx\n",
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+      } else {
+        // printf("f32: OK: %f == %f\n", f, f2);
+      }
+    }
+  }
+  if (1) {
+    float testf16[7] = {0.0, 1.0, -1.0, 10, -10, 3.1875, -3.1875};
+    float f, f2;
+
+    for (i = 0; i < 7; i++) {
+      f = testf16[i];
+      pack(buf, "f", f);
+      unpack(buf, "f", &f2);
+
+      if (f2 != f) {
+        printf("f16: %f != %f\n", f, f2);
+        printf("  before: %08x\n", *((int *)&f));
+        printf("  after:  %08x\n", *((int *)&f2));
+        printf(
+            "  buffer: %02hhx %02hhx %02hhx %02hhx "
+            " %02hhx %02hhx %02hhx %02hhx\n",
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+      } else {
+        // printf("f16: OK: %f == %f\n", f, f2);
+      }
+    }
+  }
+#endif
+
+  return 0;
+}
+```
+
+</details>
+<details>
+
+<summary>위의 코드를 사용하는 예제</summary>
+
+```c
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+/*
+** packi16() -- store a 16-bit int into a char buffer (like htons())
+*/
+void packi16(unsigned char *buf, unsigned int i) {
+  *buf++ = i >> 8;
+  *buf++ = i;
+}
+
+/*
+** packi32() -- store a 32-bit int into a char buffer (like htonl())
+*/
+void packi32(unsigned char *buf, unsigned long int i) {
+  *buf++ = i >> 24;
+  *buf++ = i >> 16;
+  *buf++ = i >> 8;
+  *buf++ = i;
+}
+
+/*
+** packi64() -- store a 64-bit int into a char buffer (like htonl())
+*/
+void packi64(unsigned char *buf, unsigned long long int i) {
+  *buf++ = i >> 56;
+  *buf++ = i >> 48;
+  *buf++ = i >> 40;
+  *buf++ = i >> 32;
+  *buf++ = i >> 24;
+  *buf++ = i >> 16;
+  *buf++ = i >> 8;
+  *buf++ = i;
+}
+
+/*
+** unpacki16() -- unpack a 16-bit int from a char buffer (like ntohs())
+*/
+int unpacki16(unsigned char *buf) {
+  unsigned int i2 = ((unsigned int)buf[0] << 8) | buf[1];
+  int i;
+
+  // change unsigned numbers to signed
+  if (i2 <= 0x7fffu) {
+    i = i2;
+  } else {
+    i = -1 - (unsigned int)(0xffffu - i2);
+  }
+
+  return i;
+}
+
+/*
+** unpacku16() -- unpack a 16-bit unsigned from a char buffer (like ntohs())
+*/
+unsigned int unpacku16(unsigned char *buf) {
+  return ((unsigned int)buf[0] << 8) | buf[1];
+}
+
+/*
+** unpacki32() -- unpack a 32-bit int from a char buffer (like ntohl())
+*/
+long int unpacki32(unsigned char *buf) {
+  unsigned long int i2 = ((unsigned long int)buf[0] << 24) |
+                         ((unsigned long int)buf[1] << 16) |
+                         ((unsigned long int)buf[2] << 8) | buf[3];
+  long int i;
+
+  // change unsigned numbers to signed
+  if (i2 <= 0x7fffffffu) {
+    i = i2;
+  } else {
+    i = -1 - (long int)(0xffffffffu - i2);
+  }
+
+  return i;
+}
+
+/*
+** unpacku32() -- unpack a 32-bit unsigned from a char buffer (like ntohl())
+*/
+unsigned long int unpacku32(unsigned char *buf) {
+  return ((unsigned long int)buf[0] << 24) | ((unsigned long int)buf[1] << 16) |
+         ((unsigned long int)buf[2] << 8) | buf[3];
+}
+
+/*
+** unpacki64() -- unpack a 64-bit int from a char buffer (like ntohl())
+*/
+long long int unpacki64(unsigned char *buf) {
+  unsigned long long int i2 = ((unsigned long long int)buf[0] << 56) |
+                              ((unsigned long long int)buf[1] << 48) |
+                              ((unsigned long long int)buf[2] << 40) |
+                              ((unsigned long long int)buf[3] << 32) |
+                              ((unsigned long long int)buf[4] << 24) |
+                              ((unsigned long long int)buf[5] << 16) |
+                              ((unsigned long long int)buf[6] << 8) | buf[7];
+  long long int i;
+
+  // change unsigned numbers to signed
+  if (i2 <= 0x7fffffffffffffffu) {
+    i = i2;
+  } else {
+    i = -1 - (long long int)(0xffffffffffffffffu - i2);
+  }
+
+  return i;
+}
+
+/*
+** unpacku64() -- unpack a 64-bit unsigned from a char buffer (like ntohl())
+*/
+unsigned long long int unpacku64(unsigned char *buf) {
+  return ((unsigned long long int)buf[0] << 56) |
+         ((unsigned long long int)buf[1] << 48) |
+         ((unsigned long long int)buf[2] << 40) |
+         ((unsigned long long int)buf[3] << 32) |
+         ((unsigned long long int)buf[4] << 24) |
+         ((unsigned long long int)buf[5] << 16) |
+         ((unsigned long long int)buf[6] << 8) | buf[7];
+}
+
+/*
+** pack() -- store data dictated by the format string in the buffer
+**
+**   bits |signed   unsigned   float   string
+**   -----+----------------------------------
+**      8 |   c        C
+**     16 |   h        H         f
+**     32 |   l        L         d
+**     64 |   q        Q         g
+**      - |                               s
+**
+**  (16-bit unsigned length is automatically prepended to strings)
+*/
+
+unsigned int pack(unsigned char *buf, char *format, ...) {
+  va_list ap;
+
+  signed char c;  // 8-bit
+  unsigned char C;
+
+  int h;  // 16-bit
+  unsigned int H;
+
+  long int l;  // 32-bit
+  unsigned long int L;
+
+  long long int q;  // 64-bit
+  unsigned long long int Q;
+
+  float f;  // floats
+  double d;
+  long double g;
+  unsigned long long int fhold;
+
+  char *s;  // strings
+  unsigned int len;
+
+  unsigned int size = 0;
+
+  va_start(ap, format);
+
+  for (; *format != '\0'; format++) {
+    switch (*format) {
+      case 'c':  // 8-bit
+        size += 1;
+        c = (signed char)va_arg(ap, int);  // promoted
+        *buf++ = c;
+        break;
+
+      case 'C':  // 8-bit unsigned
+        size += 1;
+        C = (unsigned char)va_arg(ap, unsigned int);  // promoted
+        *buf++ = C;
+        break;
+
+      case 'h':  // 16-bit
+        size += 2;
+        h = va_arg(ap, int);
+        packi16(buf, h);
+        buf += 2;
+        break;
+
+      case 'H':  // 16-bit unsigned
+        size += 2;
+        H = va_arg(ap, unsigned int);
+        packi16(buf, H);
+        buf += 2;
+        break;
+
+      case 'l':  // 32-bit
+        size += 4;
+        l = va_arg(ap, long int);
+        packi32(buf, l);
+        buf += 4;
+        break;
+
+      case 'L':  // 32-bit unsigned
+        size += 4;
+        L = va_arg(ap, unsigned long int);
+        packi32(buf, L);
+        buf += 4;
+        break;
+
+      case 'q':  // 64-bit
+        size += 8;
+        q = va_arg(ap, long long int);
+        packi64(buf, q);
+        buf += 8;
+        break;
+
+      case 'Q':  // 64-bit unsigned
+        size += 8;
+        Q = va_arg(ap, unsigned long long int);
+        packi64(buf, Q);
+        buf += 8;
+        break;
+
+      case 'f':  // float-16
+        size += 2;
+        f = (float)va_arg(ap, double);  // promoted
+        fhold = pack754_16(f);          // convert to IEEE 754
+        packi16(buf, fhold);
+        buf += 2;
+        break;
+
+      case 'd':  // float-32
+        size += 4;
+        d = va_arg(ap, double);
+        fhold = pack754_32(d);  // convert to IEEE 754
+        packi32(buf, fhold);
+        buf += 4;
+        break;
+
+      case 'g':  // float-64
+        size += 8;
+        g = va_arg(ap, long double);
+        fhold = pack754_64(g);  // convert to IEEE 754
+        packi64(buf, fhold);
+        buf += 8;
+        break;
+
+      case 's':  // string
+        s = va_arg(ap, char *);
+        len = strlen(s);
+        size += len + 2;
+        packi16(buf, len);
+        buf += 2;
+        memcpy(buf, s, len);
+        buf += len;
+        break;
+    }
+  }
+
+  va_end(ap);
+
+  return size;
+}
+
+/*
+** unpack() -- unpack data dictated by the format string into the buffer
+**
+**   bits |signed   unsigned   float   string
+**   -----+----------------------------------
+**      8 |   c        C
+**     16 |   h        H         f
+**     32 |   l        L         d
+**     64 |   q        Q         g
+**      - |                               s
+**
+**  (string is extracted based on its stored length, but 's' can be
+**  prepended with a max length)
+*/
+void unpack(unsigned char *buf, char *format, ...) {
+  va_list ap;
+
+  signed char *c;  // 8-bit
+  unsigned char *C;
+
+  int *h;  // 16-bit
+  unsigned int *H;
+
+  long int *l;  // 32-bit
+  unsigned long int *L;
+
+  long long int *q;  // 64-bit
+  unsigned long long int *Q;
+
+  float *f;  // floats
+  double *d;
+  long double *g;
+  unsigned long long int fhold;
+
+  char *s;
+  unsigned int len, maxstrlen = 0, count;
+
+  va_start(ap, format);
+
+  for (; *format != '\0'; format++) {
+    switch (*format) {
+      case 'c':  // 8-bit
+        c = va_arg(ap, signed char *);
+        if (*buf <= 0x7f) {
+          *c = *buf;
+        }  // re-sign
+        else {
+          *c = -1 - (unsigned char)(0xffu - *buf);
+        }
+        buf++;
+        break;
+
+      case 'C':  // 8-bit unsigned
+        C = va_arg(ap, unsigned char *);
+        *C = *buf++;
+        break;
+
+      case 'h':  // 16-bit
+        h = va_arg(ap, int *);
+        *h = unpacki16(buf);
+        buf += 2;
+        break;
+
+      case 'H':  // 16-bit unsigned
+        H = va_arg(ap, unsigned int *);
+        *H = unpacku16(buf);
+        buf += 2;
+        break;
+
+      case 'l':  // 32-bit
+        l = va_arg(ap, long int *);
+        *l = unpacki32(buf);
+        buf += 4;
+        break;
+
+      case 'L':  // 32-bit unsigned
+        L = va_arg(ap, unsigned long int *);
+        *L = unpacku32(buf);
+        buf += 4;
+        break;
+
+      case 'q':  // 64-bit
+        q = va_arg(ap, long long int *);
+        *q = unpacki64(buf);
+        buf += 8;
+        break;
+
+      case 'Q':  // 64-bit unsigned
+        Q = va_arg(ap, unsigned long long int *);
+        *Q = unpacku64(buf);
+        buf += 8;
+        break;
+
+      case 'f':  // float
+        f = va_arg(ap, float *);
+        fhold = unpacku16(buf);
+        *f = unpack754_16(fhold);
+        buf += 2;
+        break;
+
+      case 'd':  // float-32
+        d = va_arg(ap, double *);
+        fhold = unpacku32(buf);
+        *d = unpack754_32(fhold);
+        buf += 4;
+        break;
+
+      case 'g':  // float-64
+        g = va_arg(ap, long double *);
+        fhold = unpacku64(buf);
+        *g = unpack754_64(fhold);
+        buf += 8;
+        break;
+
+      case 's':  // string
+        s = va_arg(ap, char *);
+        len = unpacku16(buf);
+        buf += 2;
+        if (maxstrlen > 0 && len >= maxstrlen)
+          count = maxstrlen - 1;
+        else
+          count = len;
+        memcpy(s, buf, count);
+        s[count] = '\0';
+        buf += len;
+        break;
+
+      default:
+        if (isdigit(*format)) {  // track max str len
+          maxstrlen = maxstrlen * 10 + (*format - '0');
+        }
+    }
+
+    if (!isdigit(*format)) maxstrlen = 0;
+  }
+
+  va_end(ap);
+}
+```
+
+</details>
+</details>
+
+다음은 약간의 데이터를 `buf`에 넣어 패킹하고 변수에 언팩하는, 위의 코드를 시연하는 코드이다. 문자열 인수(형식 지정자 "s")와 함께 `unpack()`를 호출할 때, `96s`처럼 버퍼 오버런을 방지하기 위해 최대 길이를 앞에 붙이는 것이 좋다. 네트워크를 통해 받은 데이터를 언팩할 때에는 주의한다. 악의적인 사용자가 시스템을 공격하기 위해 나쁘게 구성된 패킷을 보낼 수 있다.
+
+```c
+#include <stdio.h>
+
+// various bits for floating point types--
+// varies for different architectures
+typedef float float32_t;
+typedef double float64_t;
+
+int main(void)
+{
+    unsigned char buf[1024];
+    int8_t magic;
+    int16_t monkeycount;
+    int32_t altitude;
+    float32_t absurdityfactor;
+    char *s = "Great unmitigated Zot! You've found the Runestaff!";
+    char s2[96];
+    int16_t packetsize, ps2;
+
+    packetsize = pack(buf, "chhlsf", (int8_t)'B', (int16_t)0, (int16_t)37, 
+            (int32_t)-5, s, (float32_t)-3490.6677);
+    packi16(buf+1, packetsize); // store packet size in packet for kicks
+
+    printf("packet is %" PRId32 " bytes\n", packetsize);
+
+    unpack(buf, "chhl96sf", &magic, &ps2, &monkeycount, &altitude, s2,
+        &absurdityfactor);
+
+    printf("'%c' %" PRId32" %" PRId16 " %" PRId32
+            " \"%s\" %f\n", magic, ps2, monkeycount,
+            altitude, s2, absurdityfactor);
+
+    return 0;
+}
+```
+
+스스로 짠 코드를 쓰거나, 남이 쓴 코드를 쓰거나, 매번 각각의 비트를 패킹하는 것보다는 버그를 쉽게 찾아내기 위해 일반적인 데이터 패킹 루틴을 따르는 것이 좋다.
